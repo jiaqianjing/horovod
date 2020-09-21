@@ -131,7 +131,7 @@ optimizer = hvd.DistributedOptimizer(
 # adjust learning rate on reset
 def on_state_reset():
     for param_group in optimizer.param_groups:
-        param_group['lr'] = args.lr * hvd.size()
+        param_group['lr'] = args.base_lr * hvd.size()
 
 
 def check_rank(epoch):
@@ -144,6 +144,21 @@ def accuracy(output, target):
     pred = output.max(1, keepdim=True)[1]
     return pred.eq(target.view_as(pred)).cpu().float().mean()
 
+class Metric(object):
+    def __init__(self, name):
+        self.name = name
+        self.sum = torch.tensor(0.)
+        self.n = torch.tensor(0.)
+
+    def update(self, val):
+        self.sum += val.detach().cpu()
+        self.n += 1
+
+    @property
+    def avg(self):
+        return self.sum / self.n
+
+
 @hvd.elastic.run
 def train(state):
     # post synchronization event (worker added, worker removed) init ...
@@ -151,26 +166,40 @@ def train(state):
         state.model.train()
         train_sampler.set_epoch(state.epoch)
         steps_remaining = len(train_loader) - state.batch
+        print("state.batch: {}\t steps_remaining: {}".format(state.batch, steps_remaining))
+        train_loss = Metric('train_loss')
+        train_accuracy = Metric('train_accuracy')
         for state.batch, (data, target) in enumerate(train_loader):
             if state.batch >= steps_remaining:
                 break
-            check_rank(state.epoch)
+            # check_rank(state.epoch)
             if args.cuda:
                 data, target = data.cuda(), target.cuda()
             state.optimizer.zero_grad()
-            output = state.model(data)
-            acc = accuracy(output, target)
-            loss = F.cross_entropy(output, target)
-            loss.backward()
-            # Gradient is applied across all ranks
+            # Split data into sub-batches of size batch_size
+            for i in range(0, len(data), args.batch_size):
+                data_batch = data[i:i + args.batch_size]
+                target_batch = target[i:i + args.batch_size]
+                output = state.model(data_batch)
+                acc = accuracy(output, target_batch)
+                # sum all sub-batches
+                train_accuracy.update(acc)
+                loss = F.cross_entropy(output, target_batch)
+                # sum all sub-batches
+                train_loss.update(loss)
+                # Average gradients among sub-batches
+                loss.div_(math.ceil(float(len(data)) / args.batch_size))
+                loss.backward()
+                # Gradient is applied across all ranks
             state.optimizer.step()
-            print("Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}\tACC: {:.2f}%".format(
+            print("Train batch: {} Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}\tACC: {:.2f}%".format(
+                state.batch,
                 state.epoch,
                 state.batch * len(data),
                 len(train_sampler),
                 100.0 * state.batch / len(train_loader),
-                loss.item(),
-                100. * acc.item()
+                train_loss.avg.item(),
+                100. * train_accuracy.avg.item()
             ))
             state.commit()
         state.batch = 0
@@ -186,4 +215,3 @@ state = hvd.elastic.TorchState(model, optimizer, epoch=1, batch=0)
 state.register_reset_callbacks([on_state_reset])
 train(state)
 test()
-
